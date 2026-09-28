@@ -6,6 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { put, del, list } from '@vercel/blob';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,116 +20,23 @@ const MAX_FILE_SIZE = 25 * 1024 * 1024;
 // 24-Hour Expiry Duration (in milliseconds)
 const EXPIRY_DURATION_MS = 24 * 60 * 60 * 1000;
 
-// Temporary upload directory setup (support Vercel /tmp)
-const uploadsDir = process.env.VERCEL
+// Local fallback uploads directory (used when BLOB_READ_WRITE_TOKEN is not set)
+const localUploadsDir = process.env.VERCEL
   ? path.join(os.tmpdir(), 'quickshare-uploads')
   : path.join(__dirname, 'uploads');
 
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// In-memory file registry for fast lookup
-const transferRegistry = new Map();
-const filenameRegistry = new Map();
-
-// Helper: load transfer metadata by ID from memory or disk
-function getTransferData(transferId) {
-  if (!transferId) return null;
-  // 1. Check in-memory map
-  let data = transferRegistry.get(transferId);
-  if (data) return data;
-
-  // 2. Check disk metadata file
-  const safeId = String(transferId).replace(/[^a-zA-Z0-9_-]/g, '');
-  const metaPath = path.join(uploadsDir, `${safeId}.json`);
-  if (fs.existsSync(metaPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-      const filePath = path.join(uploadsDir, parsed.filename);
-      if (fs.existsSync(filePath)) {
-        transferRegistry.set(parsed.transferId, parsed);
-        filenameRegistry.set(parsed.filename, parsed);
-        return parsed;
-      }
-    } catch (e) {
-      console.error(`Error reading metadata for ${transferId}:`, e);
-    }
-  }
-  return null;
-}
-
-// Helper: load transfer metadata by filename from memory or disk
-function getTransferByFilename(filename) {
-  if (!filename) return null;
-  let data = filenameRegistry.get(filename);
-  if (data) return data;
-
+if (!fs.existsSync(localUploadsDir)) {
   try {
-    if (fs.existsSync(uploadsDir)) {
-      const files = fs.readdirSync(uploadsDir);
-      for (const file of files) {
-        if (file.endsWith('.json')) {
-          try {
-            const parsed = JSON.parse(fs.readFileSync(path.join(uploadsDir, file), 'utf8'));
-            if (parsed.filename === filename) {
-              transferRegistry.set(parsed.transferId, parsed);
-              filenameRegistry.set(parsed.filename, parsed);
-              return parsed;
-            }
-          } catch (e) {}
-        }
-      }
-    }
+    fs.mkdirSync(localUploadsDir, { recursive: true });
   } catch (e) {}
-  return null;
 }
 
-// Helper: list all active transfers from disk and memory
-function getAllActiveTransfers() {
-  cleanupExpiredFiles();
-  const now = Date.now();
-  const transfersMap = new Map();
+// In-memory cache for ultra-fast lookup
+const transferCache = new Map();
 
-  // Load all .json files from uploadsDir
-  try {
-    if (fs.existsSync(uploadsDir)) {
-      const diskFiles = fs.readdirSync(uploadsDir);
-      for (const file of diskFiles) {
-        if (file.endsWith('.json')) {
-          try {
-            const parsed = JSON.parse(fs.readFileSync(path.join(uploadsDir, file), 'utf8'));
-            const expiryTime = new Date(parsed.expiresAt).getTime();
-            const filePath = path.join(uploadsDir, parsed.filename);
-            if (now < expiryTime && fs.existsSync(filePath)) {
-              transfersMap.set(parsed.transferId, parsed);
-              transferRegistry.set(parsed.transferId, parsed);
-              filenameRegistry.set(parsed.filename, parsed);
-            }
-          } catch (e) {}
-        }
-      }
-    }
-  } catch (e) {}
-
-  // Include in-memory entries if file exists
-  for (const [id, data] of transferRegistry.entries()) {
-    const expiryTime = new Date(data.expiresAt).getTime();
-    const filePath = path.join(uploadsDir, data.filename);
-    if (now < expiryTime && fs.existsSync(filePath)) {
-      transfersMap.set(id, data);
-    }
-  }
-
-  const result = Array.from(transfersMap.values()).map((file) => ({
-    ...file,
-    downloadUrl: `/api/files/${encodeURIComponent(file.filename)}/download`,
-    transferDownloadUrl: `/api/transfer/${encodeURIComponent(file.transferId)}/download`,
-    viewUrl: `/api/files/${encodeURIComponent(file.filename)}/view`
-  }));
-
-  result.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
-  return result;
+// Helper: check if Vercel Blob is configured
+function isBlobConfigured() {
+  return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 }
 
 // Generate unique, readable transfer ID (e.g., qs-4a8f9c2e)
@@ -137,128 +45,275 @@ function generateTransferId() {
   return `qs-${randomHex}`;
 }
 
-// Expired Files Cleaner
-function cleanupExpiredFiles() {
-  const now = Date.now();
-  let expiredCount = 0;
+// =========================================================================
+// STORAGE LAYER: Vercel Blob (Production) with Local Disk Fallback (Dev)
+// =========================================================================
 
-  // 1. Clean from memory & disk
-  for (const [transferId, fileData] of Array.from(transferRegistry.entries())) {
-    const expiryTime = new Date(fileData.expiresAt).getTime();
-    if (now > expiryTime) {
-      const filePath = path.join(uploadsDir, fileData.filename);
-      const metaPath = path.join(uploadsDir, `${fileData.transferId}.json`);
-      if (fs.existsSync(filePath)) {
-        try { fs.unlinkSync(filePath); } catch (e) {}
-      }
-      if (fs.existsSync(metaPath)) {
-        try { fs.unlinkSync(metaPath); } catch (e) {}
-      }
-      transferRegistry.delete(transferId);
-      filenameRegistry.delete(fileData.filename);
-      expiredCount++;
+// 1. Save file and metadata
+async function saveTransfer({ transferId, originalname, mimetype, buffer, size }) {
+  const now = Date.now();
+  const uploadedAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + EXPIRY_DURATION_MS).toISOString();
+  const safeOriginal = originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+  const uniqueFilename = `${Date.now()}-${safeOriginal}`;
+
+  if (isBlobConfigured()) {
+    // A) VERCEL BLOB STORAGE (Persistent across all serverless instances)
+    const blobPath = `quickshare/files/${transferId}/${safeOriginal}`;
+    const blobResult = await put(blobPath, buffer, {
+      access: 'public',
+      contentType: mimetype || 'application/octet-stream',
+      token: process.env.BLOB_READ_WRITE_TOKEN
+    });
+
+    const fileData = {
+      transferId,
+      filename: uniqueFilename,
+      originalname,
+      size,
+      mimetype: mimetype || 'application/octet-stream',
+      uploadedAt,
+      expiresAt,
+      storageType: 'blob',
+      blobUrl: blobResult.url,
+      blobDownloadUrl: blobResult.downloadUrl || blobResult.url,
+      downloadUrl: `/api/transfer/${encodeURIComponent(transferId)}/download`,
+      transferDownloadUrl: `/api/transfer/${encodeURIComponent(transferId)}/download`,
+      viewUrl: blobResult.url
+    };
+
+    // Save JSON metadata into Vercel Blob
+    const metaPath = `quickshare/meta/${transferId}.json`;
+    await put(metaPath, JSON.stringify(fileData, null, 2), {
+      access: 'public',
+      contentType: 'application/json',
+      token: process.env.BLOB_READ_WRITE_TOKEN
+    });
+
+    transferCache.set(transferId, fileData);
+    return fileData;
+  } else {
+    // B) LOCAL DISK FALLBACK (For local development or when Blob token is omitted)
+    const filePath = path.join(localUploadsDir, uniqueFilename);
+    fs.writeFileSync(filePath, buffer);
+
+    const fileData = {
+      transferId,
+      filename: uniqueFilename,
+      originalname,
+      size,
+      mimetype: mimetype || 'application/octet-stream',
+      uploadedAt,
+      expiresAt,
+      storageType: 'local',
+      downloadUrl: `/api/files/${encodeURIComponent(uniqueFilename)}/download`,
+      transferDownloadUrl: `/api/transfer/${encodeURIComponent(transferId)}/download`,
+      viewUrl: `/api/files/${encodeURIComponent(uniqueFilename)}/view`
+    };
+
+    const metaFilePath = path.join(localUploadsDir, `${transferId}.json`);
+    try {
+      fs.writeFileSync(metaFilePath, JSON.stringify(fileData, null, 2), 'utf8');
+    } catch (e) {}
+
+    transferCache.set(transferId, fileData);
+    return fileData;
+  }
+}
+
+// 2. Retrieve transfer metadata by transferId
+async function getTransfer(transferId) {
+  if (!transferId) return null;
+
+  // Check in-memory cache first
+  const cached = transferCache.get(transferId);
+  if (cached) {
+    if (Date.now() > new Date(cached.expiresAt).getTime()) {
+      transferCache.delete(transferId);
+      return { expired: true };
     }
+    return cached;
   }
 
-  // 2. Also clean any expired json or files directly on disk
-  try {
-    if (fs.existsSync(uploadsDir)) {
-      const diskFiles = fs.readdirSync(uploadsDir);
-      for (const file of diskFiles) {
-        const filePath = path.join(uploadsDir, file);
-        if (file.endsWith('.json')) {
-          try {
-            const meta = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-            if (now > new Date(meta.expiresAt).getTime()) {
-              fs.unlinkSync(filePath);
-              const targetFile = path.join(uploadsDir, meta.filename);
-              if (fs.existsSync(targetFile)) {
-                fs.unlinkSync(targetFile);
-              }
-              expiredCount++;
-            }
-          } catch (e) {}
-        } else {
-          try {
-            const stats = fs.statSync(filePath);
-            if (stats.isFile()) {
-              const fileAge = now - (stats.birthtimeMs || stats.mtimeMs);
-              if (fileAge > EXPIRY_DURATION_MS) {
-                fs.unlinkSync(filePath);
-                expiredCount++;
-              }
-            }
-          } catch (e) {}
+  if (isBlobConfigured()) {
+    // Query Vercel Blob metadata
+    try {
+      const { blobs } = await list({
+        prefix: `quickshare/meta/${transferId}.json`,
+        token: process.env.BLOB_READ_WRITE_TOKEN
+      });
+
+      if (blobs.length > 0) {
+        const res = await fetch(blobs[0].url);
+        if (res.ok) {
+          const meta = await res.json();
+          if (Date.now() > new Date(meta.expiresAt).getTime()) {
+            // Cleanup expired
+            del([blobs[0].url, meta.blobUrl], { token: process.env.BLOB_READ_WRITE_TOKEN }).catch(() => {});
+            return { expired: true };
+          }
+          transferCache.set(transferId, meta);
+          return meta;
         }
       }
+    } catch (err) {
+      console.error('Error fetching transfer from Vercel Blob:', err);
     }
-  } catch (err) {}
-
-  if (expiredCount > 0) {
-    console.log(`🧹 Cleaned up ${expiredCount} expired file(s)`);
+    return null;
+  } else {
+    // Query local disk
+    const safeId = String(transferId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const metaPath = path.join(localUploadsDir, `${safeId}.json`);
+    if (fs.existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        if (Date.now() > new Date(meta.expiresAt).getTime()) {
+          try { fs.unlinkSync(metaPath); } catch (e) {}
+          const fPath = path.join(localUploadsDir, meta.filename);
+          if (fs.existsSync(fPath)) { try { fs.unlinkSync(fPath); } catch (e) {} }
+          return { expired: true };
+        }
+        transferCache.set(transferId, meta);
+        return meta;
+      } catch (e) {}
+    }
+    return null;
   }
 }
 
-// Run periodic cleanup every 10 minutes (if long-running process)
-if (!process.env.VERCEL) {
-  setInterval(cleanupExpiredFiles, 10 * 60 * 1000);
+// 3. List all active transfers
+async function getAllTransfers() {
+  const now = Date.now();
+  const results = [];
+
+  if (isBlobConfigured()) {
+    try {
+      const { blobs } = await list({
+        prefix: 'quickshare/meta/',
+        token: process.env.BLOB_READ_WRITE_TOKEN
+      });
+
+      const expiredBlobUrls = [];
+      for (const b of blobs) {
+        try {
+          const res = await fetch(b.url);
+          if (res.ok) {
+            const meta = await res.json();
+            if (now > new Date(meta.expiresAt).getTime()) {
+              expiredBlobUrls.push(b.url);
+              if (meta.blobUrl) expiredBlobUrls.push(meta.blobUrl);
+            } else {
+              results.push(meta);
+              transferCache.set(meta.transferId, meta);
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (expiredBlobUrls.length > 0) {
+        del(expiredBlobUrls, { token: process.env.BLOB_READ_WRITE_TOKEN }).catch(() => {});
+      }
+    } catch (err) {
+      console.error('Error listing Vercel Blobs:', err);
+    }
+  } else {
+    try {
+      if (fs.existsSync(localUploadsDir)) {
+        const files = fs.readdirSync(localUploadsDir);
+        for (const file of files) {
+          if (file.endsWith('.json')) {
+            try {
+              const meta = JSON.parse(fs.readFileSync(path.join(localUploadsDir, file), 'utf8'));
+              if (now > new Date(meta.expiresAt).getTime()) {
+                fs.unlinkSync(path.join(localUploadsDir, file));
+                const targetFile = path.join(localUploadsDir, meta.filename);
+                if (fs.existsSync(targetFile)) fs.unlinkSync(targetFile);
+              } else {
+                results.push(meta);
+                transferCache.set(meta.transferId, meta);
+              }
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  results.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+  return results;
 }
 
-// Middlewares
+// 4. Delete transfer by identifier
+async function deleteTransfer(identifier) {
+  const meta = await getTransfer(identifier);
+  if (!meta || meta.expired) return false;
+
+  transferCache.delete(meta.transferId);
+
+  if (isBlobConfigured() && meta.storageType === 'blob') {
+    const urlsToDelete = [];
+    if (meta.blobUrl) urlsToDelete.push(meta.blobUrl);
+    try {
+      const { blobs } = await list({
+        prefix: `quickshare/meta/${meta.transferId}.json`,
+        token: process.env.BLOB_READ_WRITE_TOKEN
+      });
+      blobs.forEach((b) => urlsToDelete.push(b.url));
+      if (urlsToDelete.length > 0) {
+        await del(urlsToDelete, { token: process.env.BLOB_READ_WRITE_TOKEN });
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  } else {
+    const metaPath = path.join(localUploadsDir, `${meta.transferId}.json`);
+    const fPath = path.join(localUploadsDir, meta.filename);
+    try { if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath); } catch (e) {}
+    try { if (fs.existsSync(fPath)) fs.unlinkSync(fPath); } catch (e) {}
+    return true;
+  }
+}
+
+// =========================================================================
+// EXPRESS MIDDLEWARES & ROUTER
+// =========================================================================
+
 app.use(cors());
 app.use(express.json());
 
-// Run cleanup before handling requests
-app.use((req, res, next) => {
-  cleanupExpiredFiles();
-  next();
-});
-
-// Configure Multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    // Unique filename with timestamp & sanitized name to prevent collisions
-    const safeOriginal = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const uniqueName = `${Date.now()}-${safeOriginal}`;
-    cb(null, uniqueName);
-  }
-});
-
-// Multer upload middleware (accepts one file at a time, max 25 MB)
+// Memory storage for Multer (safe for serverless & high performance)
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: 1
   }
 }).single('file');
 
+const apiRouter = express.Router();
+
 // 1. Health check
-app.get('/api/health', (req, res) => {
-  const transfers = getAllActiveTransfers();
+apiRouter.get('/health', async (req, res) => {
+  const transfers = await getAllTransfers();
   res.json({
     status: 'ok',
     message: 'QuickShare API is active',
+    storageMode: isBlobConfigured() ? 'Vercel Blob (Persistent)' : 'Local Disk / Temp',
     maxFileSizeMB: 25,
     expiryHours: 24,
     activeTransfers: transfers.length
   });
 });
 
-// 2. Upload Single File (with 24-hour expiry & unique transfer ID)
-app.post('/api/upload', (req, res) => {
-  upload(req, res, (err) => {
+// 2. Upload Single File
+apiRouter.post('/upload', (req, res) => {
+  upload(req, res, async (err) => {
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(413).json({
           error: 'File too large',
-          message: 'The selected file exceeds the 25 MB limit for this workshop demo.'
+          message: 'The selected file exceeds the 25 MB limit for QuickShare.'
         });
       }
       if (err.code === 'LIMIT_UNEXPECTED_FILE' || err.code === 'LIMIT_FILE_COUNT') {
@@ -267,14 +322,11 @@ app.post('/api/upload', (req, res) => {
           message: 'Please upload only one file at a time.'
         });
       }
-      return res.status(400).json({
-        error: 'Upload error',
-        message: err.message
-      });
+      return res.status(400).json({ error: 'Upload error', message: err.message });
     } else if (err) {
       return res.status(500).json({
         error: 'Server error',
-        message: 'An unexpected error occurred while saving the file.'
+        message: 'An unexpected error occurred while processing the file.'
       });
     }
 
@@ -285,55 +337,42 @@ app.post('/api/upload', (req, res) => {
       });
     }
 
-    const transferId = generateTransferId();
-    const now = Date.now();
-    const uploadedAt = new Date(now).toISOString();
-    const expiresAt = new Date(now + EXPIRY_DURATION_MS).toISOString();
-
-    const fileData = {
-      transferId,
-      filename: req.file.filename,
-      originalname: req.file.originalname,
-      size: req.file.size,
-      mimetype: req.file.mimetype || 'application/octet-stream',
-      uploadedAt,
-      expiresAt,
-      downloadUrl: `/api/files/${encodeURIComponent(req.file.filename)}/download`,
-      transferDownloadUrl: `/api/transfer/${encodeURIComponent(transferId)}/download`,
-      viewUrl: `/api/files/${encodeURIComponent(req.file.filename)}/view`
-    };
-
-    // Store in in-memory registries
-    transferRegistry.set(transferId, fileData);
-    filenameRegistry.set(req.file.filename, fileData);
-
-    // Persist JSON metadata to disk for serverless/restart survivability
     try {
-      const metaPath = path.join(uploadsDir, `${transferId}.json`);
-      fs.writeFileSync(metaPath, JSON.stringify(fileData, null, 2), 'utf8');
-    } catch (e) {
-      console.error('Failed to write transfer metadata json:', e);
-    }
+      const transferId = generateTransferId();
+      const fileData = await saveTransfer({
+        transferId,
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        buffer: req.file.buffer,
+        size: req.file.size
+      });
 
-    return res.status(201).json({
-      message: 'File uploaded successfully! Available for 24 hours.',
-      transferId,
-      expiresAt,
-      file: fileData
-    });
+      return res.status(201).json({
+        message: 'File uploaded successfully! Available for 24 hours.',
+        transferId: fileData.transferId,
+        expiresAt: fileData.expiresAt,
+        file: fileData
+      });
+    } catch (saveError) {
+      console.error('Storage save error:', saveError);
+      return res.status(500).json({
+        error: 'Storage error',
+        message: 'Failed to persist uploaded file to storage.'
+      });
+    }
   });
 });
 
 // 3. List all active files/transfers
-app.get('/api/files', (req, res) => {
-  const files = getAllActiveTransfers();
+apiRouter.get('/files', async (req, res) => {
+  const files = await getAllTransfers();
   res.json({ files, count: files.length });
 });
 
-// 4. Get transfer by Transfer ID (checks 24h expiry)
-app.get('/api/transfer/:transferId', (req, res) => {
+// 4. Get transfer by Transfer ID
+apiRouter.get('/transfer/:transferId', async (req, res) => {
   const { transferId } = req.params;
-  const fileData = getTransferData(transferId);
+  const fileData = await getTransfer(transferId);
 
   if (!fileData) {
     return res.status(404).json({
@@ -342,37 +381,20 @@ app.get('/api/transfer/:transferId', (req, res) => {
     });
   }
 
-  // Check if expired
-  if (Date.now() > new Date(fileData.expiresAt).getTime()) {
-    cleanupExpiredFiles();
+  if (fileData.expired) {
     return res.status(410).json({
       error: 'Transfer expired',
       message: 'This transfer expired after 24 hours and has been permanently removed.'
     });
   }
 
-  const filePath = path.join(uploadsDir, fileData.filename);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({
-      error: 'File missing',
-      message: 'The file for this transfer is no longer available on the server.'
-    });
-  }
-
-  res.json({
-    transfer: {
-      ...fileData,
-      downloadUrl: `/api/files/${encodeURIComponent(fileData.filename)}/download`,
-      transferDownloadUrl: `/api/transfer/${encodeURIComponent(fileData.transferId)}/download`,
-      viewUrl: `/api/files/${encodeURIComponent(fileData.filename)}/view`
-    }
-  });
+  res.json({ transfer: fileData });
 });
 
 // 4b. Download directly by Transfer ID
-app.get('/api/transfer/:transferId/download', (req, res) => {
+apiRouter.get('/transfer/:transferId/download', async (req, res) => {
   const { transferId } = req.params;
-  const fileData = getTransferData(transferId);
+  const fileData = await getTransfer(transferId);
 
   if (!fileData) {
     return res.status(404).json({
@@ -381,64 +403,82 @@ app.get('/api/transfer/:transferId/download', (req, res) => {
     });
   }
 
-  if (Date.now() > new Date(fileData.expiresAt).getTime()) {
-    cleanupExpiredFiles();
+  if (fileData.expired) {
     return res.status(410).json({
       error: 'Transfer expired',
       message: 'This file transfer expired after 24 hours and has been removed.'
     });
   }
 
-  const filePath = path.join(uploadsDir, fileData.filename);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({
-      error: 'File missing',
-      message: 'The file for this transfer is no longer available on the server.'
+  if (fileData.storageType === 'blob' && fileData.blobUrl) {
+    // Stream or redirect to Blob URL with download header
+    try {
+      const blobFetch = await fetch(fileData.blobUrl);
+      if (blobFetch.ok) {
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(fileData.originalname)}"`
+        );
+        res.setHeader('Content-Type', fileData.mimetype || 'application/octet-stream');
+        const arrayBuf = await blobFetch.arrayBuffer();
+        return res.send(Buffer.from(arrayBuf));
+      }
+    } catch (e) {}
+    // Fallback: direct redirect
+    return res.redirect(fileData.blobDownloadUrl || fileData.blobUrl);
+  } else {
+    // Local disk download
+    const filePath = path.join(localUploadsDir, fileData.filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        error: 'File missing',
+        message: 'The file for this transfer is no longer available on the server.'
+      });
+    }
+
+    res.download(filePath, fileData.originalname, (err) => {
+      if (err && !res.headersSent) {
+        res.status(500).json({ error: 'Download error', message: 'Could not stream file download.' });
+      }
     });
   }
-
-  res.download(filePath, fileData.originalname, (err) => {
-    if (err && !res.headersSent) {
-      res.status(500).json({ error: 'Download error', message: 'Could not stream file download.' });
-    }
-  });
 });
 
-// 5. Download file by filename
-app.get('/api/files/:filename/download', (req, res) => {
+// 5. Download file by filename (legacy compatibility)
+apiRouter.get('/files/:filename/download', async (req, res) => {
   const filename = path.basename(req.params.filename);
-  const filePath = path.join(uploadsDir, filename);
+  const transfers = await getAllTransfers();
+  const fileData = transfers.find((t) => t.filename === filename);
 
-  if (!fs.existsSync(filePath)) {
+  if (!fileData) {
     return res.status(404).json({
       error: 'File not found',
       message: 'The requested file could not be found or has expired.'
     });
   }
 
-  const fileInfo = getTransferByFilename(filename);
-  if (fileInfo && Date.now() > new Date(fileInfo.expiresAt).getTime()) {
-    cleanupExpiredFiles();
-    return res.status(410).json({
-      error: 'File expired',
-      message: 'This file transfer expired after 24 hours.'
-    });
-  }
-
-  const downloadName = fileInfo ? fileInfo.originalname : filename;
-
-  res.download(filePath, downloadName, (err) => {
-    if (err && !res.headersSent) {
-      res.status(500).json({ error: 'Download error', message: 'Could not stream file download.' });
+  if (fileData.storageType === 'blob' && fileData.blobUrl) {
+    return res.redirect(fileData.blobDownloadUrl || fileData.blobUrl);
+  } else {
+    const filePath = path.join(localUploadsDir, filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found', message: 'File missing on server.' });
     }
-  });
+    res.download(filePath, fileData.originalname);
+  }
 });
 
 // 6. View / Stream file inline (for previewing images, videos, PDFs)
-app.get('/api/files/:filename/view', (req, res) => {
+apiRouter.get('/files/:filename/view', async (req, res) => {
   const filename = path.basename(req.params.filename);
-  const filePath = path.join(uploadsDir, filename);
+  const transfers = await getAllTransfers();
+  const fileData = transfers.find((t) => t.filename === filename);
 
+  if (fileData && fileData.storageType === 'blob' && fileData.blobUrl) {
+    return res.redirect(fileData.blobUrl);
+  }
+
+  const filePath = path.join(localUploadsDir, filename);
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({
       error: 'File not found',
@@ -446,53 +486,35 @@ app.get('/api/files/:filename/view', (req, res) => {
     });
   }
 
-  const fileInfo = getTransferByFilename(filename);
-  if (fileInfo && fileInfo.mimetype) {
-    res.setHeader('Content-Type', fileInfo.mimetype);
+  if (fileData && fileData.mimetype) {
+    res.setHeader('Content-Type', fileData.mimetype);
   }
-
   res.sendFile(filePath);
 });
 
-// 7. Delete file (by filename or transfer ID)
-app.delete('/api/files/:identifier', (req, res) => {
+// 7. Delete file by identifier
+apiRouter.delete('/files/:identifier', async (req, res) => {
   const { identifier } = req.params;
-  
-  let fileData = getTransferData(identifier) || getTransferByFilename(identifier);
-  const filename = fileData ? fileData.filename : path.basename(identifier);
-  const filePath = path.join(uploadsDir, filename);
+  const success = await deleteTransfer(identifier);
 
-  if (!fs.existsSync(filePath) && !fileData) {
+  if (!success) {
     return res.status(404).json({ error: 'Not found', message: 'File does not exist or has expired.' });
   }
 
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-    if (fileData) {
-      const metaPath = path.join(uploadsDir, `${fileData.transferId}.json`);
-      if (fs.existsSync(metaPath)) {
-        try { fs.unlinkSync(metaPath); } catch (e) {}
-      }
-      transferRegistry.delete(fileData.transferId);
-      filenameRegistry.delete(fileData.filename);
-    } else {
-      filenameRegistry.delete(filename);
-    }
-
-    res.json({ message: 'File deleted successfully', filename });
-  } catch (err) {
-    console.error('Delete error:', err);
-    res.status(500).json({ error: 'Failed to delete file' });
-  }
+  res.json({ message: 'File deleted successfully', identifier });
 });
 
-// Start Server if run directly (not serverless)
+// Mount router on both '/api' and '/' for complete Vercel / local compatibility
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
+
+// Start Server if run directly (local node server)
 if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     console.log(`🚀 QuickShare Backend running at http://localhost:${PORT}`);
-    console.log(`📁 File limit: 25 MB | Expiry: 24 hours | Uploads: ${uploadsDir}`);
+    console.log(
+      `📁 Storage Mode: ${isBlobConfigured() ? 'Vercel Blob (Persistent)' : 'Local Disk / Temp (' + localUploadsDir + ')'}`
+    );
   });
 }
 
