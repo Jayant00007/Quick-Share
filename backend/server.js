@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
@@ -18,8 +19,11 @@ const MAX_FILE_SIZE = 25 * 1024 * 1024;
 // 24-Hour Expiry Duration (in milliseconds)
 const EXPIRY_DURATION_MS = 24 * 60 * 60 * 1000;
 
-// Temporary upload directory setup
-const uploadsDir = path.join(__dirname, 'uploads');
+// Temporary upload directory setup (support Vercel /tmp)
+const uploadsDir = process.env.VERCEL
+  ? path.join(os.tmpdir(), 'quickshare-uploads')
+  : path.join(__dirname, 'uploads');
+
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -82,33 +86,35 @@ function cleanupExpiredFiles() {
 
 // Populate registry with any existing non-expired files in uploads on startup
 try {
-  const existingFiles = fs.readdirSync(uploadsDir);
-  const now = Date.now();
-  for (const filename of existingFiles) {
-    const filePath = path.join(uploadsDir, filename);
-    const stats = fs.statSync(filePath);
-    if (stats.isFile()) {
-      const createdTime = stats.birthtimeMs || stats.mtimeMs;
-      const expiresAtMs = createdTime + EXPIRY_DURATION_MS;
+  if (fs.existsSync(uploadsDir)) {
+    const existingFiles = fs.readdirSync(uploadsDir);
+    const now = Date.now();
+    for (const filename of existingFiles) {
+      const filePath = path.join(uploadsDir, filename);
+      const stats = fs.statSync(filePath);
+      if (stats.isFile()) {
+        const createdTime = stats.birthtimeMs || stats.mtimeMs;
+        const expiresAtMs = createdTime + EXPIRY_DURATION_MS;
 
-      if (now > expiresAtMs) {
-        // Expired already
-        fs.unlinkSync(filePath);
-      } else {
-        const match = filename.match(/^\d+-(.+)$/);
-        const originalname = match ? match[1] : filename;
-        const transferId = generateTransferId();
-        const fileData = {
-          transferId,
-          filename,
-          originalname,
-          size: stats.size,
-          mimetype: 'application/octet-stream',
-          uploadedAt: new Date(createdTime).toISOString(),
-          expiresAt: new Date(expiresAtMs).toISOString()
-        };
-        transferRegistry.set(transferId, fileData);
-        filenameRegistry.set(filename, fileData);
+        if (now > expiresAtMs) {
+          // Expired already
+          fs.unlinkSync(filePath);
+        } else {
+          const match = filename.match(/^\d+-(.+)$/);
+          const originalname = match ? match[1] : filename;
+          const transferId = generateTransferId();
+          const fileData = {
+            transferId,
+            filename,
+            originalname,
+            size: stats.size,
+            mimetype: 'application/octet-stream',
+            uploadedAt: new Date(createdTime).toISOString(),
+            expiresAt: new Date(expiresAtMs).toISOString()
+          };
+          transferRegistry.set(transferId, fileData);
+          filenameRegistry.set(filename, fileData);
+        }
       }
     }
   }
@@ -116,8 +122,10 @@ try {
   console.error('Notice: Could not index existing files on startup:', err);
 }
 
-// Run periodic cleanup every 10 minutes
-setInterval(cleanupExpiredFiles, 10 * 60 * 1000);
+// Run periodic cleanup every 10 minutes (if long-running process)
+if (!process.env.VERCEL) {
+  setInterval(cleanupExpiredFiles, 10 * 60 * 1000);
+}
 
 // Middlewares
 app.use(cors());
@@ -132,6 +140,9 @@ app.use((req, res, next) => {
 // Configure Multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
     cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
@@ -389,8 +400,12 @@ app.delete('/api/files/:identifier', (req, res) => {
   }
 });
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`🚀 QuickShare Backend running at http://localhost:${PORT}`);
-  console.log(`📁 File limit: 25 MB | Expiry: 24 hours | Uploads: ${uploadsDir}`);
-});
+// Start Server if run directly (not serverless)
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`🚀 QuickShare Backend running at http://localhost:${PORT}`);
+    console.log(`📁 File limit: 25 MB | Expiry: 24 hours | Uploads: ${uploadsDir}`);
+  });
+}
+
+export default app;
