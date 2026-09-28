@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { QRCodeSVG, QRCodeCanvas } from 'qrcode.react';
 import {
   UploadCloud,
   File,
@@ -27,7 +28,13 @@ import {
   Home,
   ArrowLeft,
   Clock,
-  Sparkles
+  Sparkles,
+  QrCode,
+  Smartphone,
+  Maximize2,
+  ImageDown,
+  DownloadCloud,
+  CheckCircle2
 } from 'lucide-react';
 import './App.css';
 
@@ -77,7 +84,7 @@ function formatTimeRemaining(expiresAtString) {
 // Utility: get icon & class for file type
 function getFileIcon(filename = '', mimetype = '') {
   const ext = filename.split('.').pop().toLowerCase();
-  
+
   if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(ext) || mimetype.startsWith('image/')) {
     return { icon: <ImageIcon size={26} />, className: 'icon-image', label: 'IMAGE' };
   }
@@ -99,15 +106,29 @@ function getFileIcon(filename = '', mimetype = '') {
   return { icon: <File size={26} />, className: 'icon-other', label: 'FILE' };
 }
 
-// Extract transferId from current URL (supports /download/:id, /transfer/:id, or ?transfer=:id)
+// Extract transferId from current URL (supports /download/:id, /transfer/:id, ?download=:id, ?transfer=:id, and hash)
 function getTransferIdFromUrl() {
   const pathname = window.location.pathname;
-  const pathMatch = pathname.match(/^\/(?:download|transfer)\/([a-zA-Z0-9_-]+)/i);
+  const pathMatch = pathname.match(/^\/(?:download|transfer|d)\/([a-zA-Z0-9_-]+)/i);
   if (pathMatch && pathMatch[1]) {
     return pathMatch[1];
   }
   const params = new URLSearchParams(window.location.search);
-  return params.get('transfer') || params.get('id') || null;
+  if (params.get('transfer')) return params.get('transfer');
+  if (params.get('download')) return params.get('download');
+  if (params.get('id')) return params.get('id');
+
+  const hash = window.location.hash;
+  if (hash) {
+    const hashParams = new URLSearchParams(hash.replace(/^#\/?/, '?'));
+    if (hashParams.get('transfer')) return hashParams.get('transfer');
+    if (hashParams.get('download')) return hashParams.get('download');
+    const hashMatch = hash.match(/^#\/?(?:download|transfer|d)?\/?([a-zA-Z0-9_-]+)/i);
+    if (hashMatch && hashMatch[1] && hashMatch[1].startsWith('qs-')) {
+      return hashMatch[1];
+    }
+  }
+  return null;
 }
 
 export default function App() {
@@ -127,6 +148,9 @@ export default function App() {
   const [copiedId, setCopiedId] = useState(null);
   const [toasts, setToasts] = useState([]);
 
+  // QR Modal State
+  const [activeQrModal, setActiveQrModal] = useState(null); // { transferId, filename, originalname, size, expiresAt, url }
+
   // Download Page State
   const [downloadFileData, setDownloadFileData] = useState(null);
   const [isLoadingDownload, setIsLoadingDownload] = useState(false);
@@ -136,7 +160,7 @@ export default function App() {
 
   // Show Toast
   const addToast = (message, type = 'success') => {
-    const id = Date.now();
+    const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -204,7 +228,7 @@ export default function App() {
       })
       .catch(() => {
         if (isMounted) {
-          setDownloadError('Unable to connect to server. Please check your network connection.');
+          setDownloadError('Unable to connect to QuickShare server. Please check your network connection.');
           setDownloadFileData(null);
         }
       })
@@ -222,6 +246,12 @@ export default function App() {
     window.history.pushState({}, '', path);
     setCurrentTransferId(transferId);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // Helper to build full absolute URL
+  const getShareableUrl = (transferId) => {
+    if (!transferId) return '';
+    return `${window.location.origin}/download/${transferId}`;
   };
 
   // Validate and set chosen file (one file at a time, max 25MB)
@@ -322,7 +352,7 @@ export default function App() {
         if (xhr.status >= 200 && xhr.status < 300) {
           setUploadProgress(100);
           setLatestTransfer(response);
-          addToast(`Upload complete! Transfer ID: ${response.transferId}`, 'success');
+          addToast(`Upload complete! QR code generated for transfer ID: ${response.transferId}`, 'success');
           setSelectedFile(null);
           if (fileInputRef.current) fileInputRef.current.value = '';
           fetchFiles();
@@ -340,7 +370,7 @@ export default function App() {
 
     xhr.onerror = () => {
       setIsUploading(false);
-      const errorMsg = 'Network error: Unable to connect to Express backend. Is the server running on port 5001?';
+      const errorMsg = 'Network error: Unable to connect to backend server.';
       setUploadError(errorMsg);
       addToast(errorMsg, 'error');
     };
@@ -366,6 +396,9 @@ export default function App() {
           setDownloadFileData(null);
           setDownloadError('This file has been deleted.');
         }
+        if (activeQrModal && activeQrModal.filename === filename) {
+          setActiveQrModal(null);
+        }
         addToast(`Deleted "${originalname}"`, 'success');
       } else {
         addToast('Failed to delete file', 'error');
@@ -383,6 +416,31 @@ export default function App() {
     setTimeout(() => {
       setCopiedId(null);
     }, 2000);
+  };
+
+  // Download QR Code as PNG image directly
+  const downloadQrAsPng = (transferId, originalname = 'quickshare-transfer') => {
+    const canvasId = `qr-canvas-${transferId}`;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) {
+      addToast('QR Canvas not ready', 'error');
+      return;
+    }
+
+    try {
+      const pngUrl = canvas.toDataURL('image/png');
+      const downloadLink = document.createElement('a');
+      const safeName = (originalname || transferId).replace(/[^a-zA-Z0-9.-]/g, '_');
+      downloadLink.href = pngUrl;
+      downloadLink.download = `quickshare-qr-${safeName}.png`;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      document.body.removeChild(downloadLink);
+      addToast('QR Code saved as PNG image!', 'success');
+    } catch (err) {
+      console.error('QR download error:', err);
+      addToast('Could not save QR image', 'error');
+    }
   };
 
   // Filtered files
@@ -412,7 +470,7 @@ export default function App() {
             </div>
             <div className="brand-text">
               <span className="brand-name">QuickShare</span>
-              <span className="brand-pill">24H EXPIRY</span>
+              <span className="brand-pill">QR & 24H EXPIRY</span>
             </div>
           </div>
 
@@ -493,72 +551,165 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="download-file-hero">
-                  <div
-                    className={`download-type-large ${
-                      getFileIcon(downloadFileData.originalname, downloadFileData.mimetype).className
-                    }`}
-                  >
-                    {getFileIcon(downloadFileData.originalname, downloadFileData.mimetype).icon}
+                <div className="download-card-body-grid">
+                  {/* Left Column: File Details & Primary Download */}
+                  <div className="download-file-main-col">
+                    <div className="download-file-hero">
+                      <div
+                        className={`download-type-large ${
+                          getFileIcon(downloadFileData.originalname, downloadFileData.mimetype).className
+                        }`}
+                      >
+                        {getFileIcon(downloadFileData.originalname, downloadFileData.mimetype).icon}
+                      </div>
+
+                      <h1 className="download-filename" title={downloadFileData.originalname}>
+                        {downloadFileData.originalname}
+                      </h1>
+
+                      <div className="download-file-stats">
+                        <span className="stat-pill">{formatBytes(downloadFileData.size)}</span>
+                        <span className="dot-sep">•</span>
+                        <span>Uploaded {formatDate(downloadFileData.uploadedAt)}</span>
+                        <span className="dot-sep">•</span>
+                        <span className="transfer-id-subtle">ID: {downloadFileData.transferId}</span>
+                      </div>
+                    </div>
+
+                    {/* Primary Hero Download Button */}
+                    <div className="download-actions-block">
+                      <a
+                        href={`/api/transfer/${encodeURIComponent(downloadFileData.transferId)}/download`}
+                        className="btn-download-hero"
+                        download={downloadFileData.originalname}
+                      >
+                        <Download size={22} />
+                        <span>Download File ({formatBytes(downloadFileData.size)})</span>
+                      </a>
+
+                      <div className="download-secondary-actions">
+                        <a
+                          href={`/api/files/${encodeURIComponent(downloadFileData.filename)}/view`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="btn-secondary-action"
+                          title="Preview file in browser"
+                        >
+                          <ExternalLink size={16} />
+                          <span>Preview File</span>
+                        </a>
+
+                        <button
+                          type="button"
+                          className="btn-secondary-action"
+                          onClick={() =>
+                            copyToClipboard(
+                              window.location.href,
+                              'share-page-link',
+                              'Download page link copied!'
+                            )
+                          }
+                        >
+                          {copiedId === 'share-page-link' ? (
+                            <>
+                              <Check size={16} color="#10b981" />
+                              <span>Link Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Share2 size={16} />
+                              <span>Share Link</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
-                  <h1 className="download-filename" title={downloadFileData.originalname}>
-                    {downloadFileData.originalname}
-                  </h1>
+                  {/* Right Column: Scan QR Code for Mobile Download */}
+                  <div className="download-qr-sidebar-card">
+                    <div className="qr-sidebar-header">
+                      <Smartphone size={16} className="qr-mobile-icon" />
+                      <span>Scan to Download on Phone</span>
+                    </div>
 
-                  <div className="download-file-stats">
-                    <span className="stat-pill">{formatBytes(downloadFileData.size)}</span>
-                    <span className="dot-sep">•</span>
-                    <span>Uploaded {formatDate(downloadFileData.uploadedAt)}</span>
-                  </div>
-                </div>
-
-                {/* Primary Download Button */}
-                <div className="download-actions-block">
-                  <a
-                    href={`/api/transfer/${encodeURIComponent(downloadFileData.transferId)}/download`}
-                    className="btn-download-hero"
-                    download={downloadFileData.originalname}
-                  >
-                    <Download size={20} />
-                    <span>Download File ({formatBytes(downloadFileData.size)})</span>
-                  </a>
-
-                  <div className="download-secondary-actions">
-                    <a
-                      href={`/api/files/${encodeURIComponent(downloadFileData.filename)}/view`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-secondary-action"
-                      title="Preview in new tab"
-                    >
-                      <ExternalLink size={16} />
-                      <span>Preview File</span>
-                    </a>
-
-                    <button
-                      type="button"
-                      className="btn-secondary-action"
+                    <div
+                      className="qr-code-interactive-frame"
+                      title="Click to enlarge QR Code"
                       onClick={() =>
-                        copyToClipboard(
-                          window.location.href,
-                          'share-page-link',
-                          'Download page link copied!'
-                        )
+                        setActiveQrModal({
+                          transferId: downloadFileData.transferId,
+                          filename: downloadFileData.filename,
+                          originalname: downloadFileData.originalname,
+                          size: downloadFileData.size,
+                          expiresAt: downloadFileData.expiresAt,
+                          url: window.location.href
+                        })
                       }
                     >
-                      {copiedId === 'share-page-link' ? (
-                        <>
-                          <Check size={16} color="#10b981" />
-                          <span>Link Copied!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Share2 size={16} />
-                          <span>Share Page Link</span>
-                        </>
-                      )}
-                    </button>
+                      <QRCodeSVG
+                        value={window.location.href}
+                        size={150}
+                        bgColor="#ffffff"
+                        fgColor="#090d16"
+                        level="Q"
+                        marginSize={2}
+                      />
+                      <div className="qr-hover-overlay">
+                        <Maximize2 size={24} />
+                        <span>Click to Enlarge</span>
+                      </div>
+                    </div>
+
+                    {/* Hidden canvas for high-res PNG download */}
+                    <div style={{ display: 'none' }}>
+                      <QRCodeCanvas
+                        id={`qr-canvas-${downloadFileData.transferId}`}
+                        value={window.location.href}
+                        size={400}
+                        bgColor="#ffffff"
+                        fgColor="#090d16"
+                        level="H"
+                        marginSize={3}
+                      />
+                    </div>
+
+                    <p className="qr-sidebar-hint">
+                      Point your phone camera to download directly to your mobile device.
+                    </p>
+
+                    <div className="qr-sidebar-actions">
+                      <button
+                        type="button"
+                        className="btn-qr-mini"
+                        onClick={() =>
+                          downloadQrAsPng(downloadFileData.transferId, downloadFileData.originalname)
+                        }
+                        title="Download QR code image as PNG"
+                      >
+                        <ImageDown size={14} />
+                        <span>Save QR</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="btn-qr-mini"
+                        onClick={() =>
+                          setActiveQrModal({
+                            transferId: downloadFileData.transferId,
+                            filename: downloadFileData.filename,
+                            originalname: downloadFileData.originalname,
+                            size: downloadFileData.size,
+                            expiresAt: downloadFileData.expiresAt,
+                            url: window.location.href
+                          })
+                        }
+                        title="Enlarge QR code"
+                      >
+                        <Maximize2 size={14} />
+                        <span>Enlarge</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -572,17 +723,17 @@ export default function App() {
             {/* Hero Section */}
             <section className="hero-section">
               <div className="hero-badge">
-                <ShieldCheck size={14} />
-                <span>Single-File Transfer • 25 MB Limit • 24-Hour Auto Expiry</span>
+                <Sparkles size={14} />
+                <span>Single-File Transfer • 25 MB Limit • Instant QR Code • 24h Expiry</span>
               </div>
 
               <h1 className="hero-title">
                 Effortless file sharing, <br />
-                <span className="gradient-text">lightning fast.</span>
+                <span className="gradient-text">lightning fast with QR code.</span>
               </h1>
 
               <p className="hero-subtitle">
-                Upload your file to generate a unique Transfer ID and dedicated download page. Files are automatically cleaned up after 24 hours.
+                Upload your file to generate an instant shareable link, unique Transfer ID, and scannable QR code for easy mobile downloads. Files auto-expire in 24 hours.
               </p>
             </section>
 
@@ -612,7 +763,7 @@ export default function App() {
                   </h2>
 
                   <p className="dropzone-subtext">
-                    Accepts 1 file at a time • Maximum size: <strong>25 MB</strong> • 24h Expiry
+                    Accepts 1 file at a time • Maximum size: <strong>25 MB</strong> • 24h Auto-Expiry
                   </p>
 
                   <button
@@ -643,7 +794,7 @@ export default function App() {
                 <div className="error-banner animate-fade-in">
                   <AlertCircle size={18} className="error-banner-icon" />
                   <div className="error-banner-content">
-                    <strong className="error-banner-title">Upload Warning</strong>
+                    <strong className="error-banner-title">Upload Error</strong>
                     <p className="error-banner-text">{uploadError}</p>
                   </div>
                   <button
@@ -656,7 +807,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Selected File Details */}
+              {/* Selected File Details & Upload Button */}
               {selectedFile && (
                 <div className="selection-panel animate-fade-in">
                   <div className="selection-header">
@@ -711,7 +862,7 @@ export default function App() {
                       <div className="progress-info">
                         <span className="progress-label">
                           <RefreshCw size={14} className="spin-animation" />
-                          Uploading to Express backend...
+                          Uploading to backend server...
                         </span>
                         <span className="progress-percent">{uploadProgress}%</span>
                       </div>
@@ -740,7 +891,7 @@ export default function App() {
                       ) : (
                         <>
                           <UploadCloud size={18} />
-                          <span>Upload File to Server</span>
+                          <span>Upload & Generate QR Code</span>
                           <ArrowRight size={16} />
                         </>
                       )}
@@ -749,120 +900,218 @@ export default function App() {
                 </div>
               )}
 
-              {/* Success Banner / Shareable Link & Transfer ID */}
+              {/* ========================================================= */}
+              {/* SUCCESS BANNER WITH LINK + INTERACTIVE QR CODE CARD       */}
+              {/* ========================================================= */}
               {latestTransfer && latestTransfer.file && (
                 <div className="success-transfer-card animate-fade-in">
                   <div className="success-badge-row">
                     <div className="success-icon-badge">
-                      <Check size={20} />
+                      <CheckCircle2 size={22} />
                     </div>
                     <div>
                       <h3 className="success-title">Upload Successful!</h3>
                       <p className="success-subtitle">
-                        Your file is ready to share. Available for 24 hours.
+                        Your file is ready to share via link or QR Code. Valid for 24 hours.
                       </p>
                     </div>
                   </div>
 
-                  {/* Shareable Link Box with Copy Button */}
-                  <div className="shareable-link-container">
-                    <div className="shareable-link-header">
-                      <span className="shareable-link-label">SHAREABLE DOWNLOAD LINK</span>
-                      <span className="expiry-hint">
-                        <Clock size={12} />
-                        Expires in 24 hours
-                      </span>
-                    </div>
-                    <div className="shareable-link-box">
-                      <input
-                        type="text"
-                        readOnly
-                        value={`${window.location.origin}/download/${latestTransfer.transferId}`}
-                        className="shareable-link-input"
-                      />
-                      <button
-                        type="button"
-                        className="btn-copy-link-highlight"
-                        onClick={() => {
-                          const pageLink = `${window.location.origin}/download/${latestTransfer.transferId}`;
-                          copyToClipboard(pageLink, 'shareable-link', 'Shareable link copied!');
-                        }}
-                      >
-                        {copiedId === 'shareable-link' ? (
-                          <>
-                            <Check size={16} color="#10b981" />
-                            <span>Copied!</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy size={16} />
-                            <span>Copy Link</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
+                  <div className="success-split-layout">
+                    {/* Left Column: Link, Transfer ID, & Direct Navigation */}
+                    <div className="success-details-column">
+                      {/* Shareable Link Box */}
+                      <div className="shareable-link-container">
+                        <div className="shareable-link-header">
+                          <span className="shareable-link-label">SHAREABLE DOWNLOAD LINK</span>
+                          <span className="expiry-hint">
+                            <Clock size={12} />
+                            24h Auto-Expiry
+                          </span>
+                        </div>
+                        <div className="shareable-link-box">
+                          <input
+                            type="text"
+                            readOnly
+                            value={getShareableUrl(latestTransfer.transferId)}
+                            className="shareable-link-input"
+                            onClick={(e) => e.target.select()}
+                          />
+                          <button
+                            type="button"
+                            className="btn-copy-link-highlight"
+                            onClick={() => {
+                              const pageLink = getShareableUrl(latestTransfer.transferId);
+                              copyToClipboard(pageLink, 'shareable-link', 'Shareable link copied!');
+                            }}
+                          >
+                            {copiedId === 'shareable-link' ? (
+                              <>
+                                <Check size={16} color="#10b981" />
+                                <span>Copied!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy size={16} />
+                                <span>Copy Link</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
 
-                  {/* Transfer ID & Actions */}
-                  <div className="transfer-id-display">
-                    <div className="transfer-id-info">
-                      <span className="id-label">UNIQUE TRANSFER ID</span>
-                      <span className="id-value">
-                        <KeyRound size={15} />
-                        {latestTransfer.transferId}
-                      </span>
+                      {/* Transfer ID Box */}
+                      <div className="transfer-id-display">
+                        <div className="transfer-id-info">
+                          <span className="id-label">UNIQUE TRANSFER ID</span>
+                          <span className="id-value">
+                            <KeyRound size={15} />
+                            {latestTransfer.transferId}
+                          </span>
+                        </div>
+                        <div className="transfer-id-actions">
+                          <button
+                            type="button"
+                            className="btn-copy-id"
+                            onClick={() =>
+                              copyToClipboard(
+                                latestTransfer.transferId,
+                                `id-${latestTransfer.transferId}`,
+                                'Transfer ID copied!'
+                              )
+                            }
+                          >
+                            {copiedId === `id-${latestTransfer.transferId}` ? (
+                              <>
+                                <Check size={14} color="#10b981" />
+                                <span>Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy size={14} />
+                                <span>Copy ID</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="success-action-row">
+                        <button
+                          type="button"
+                          className="btn-open-download-page"
+                          onClick={() =>
+                            navigateTo(
+                              `/download/${latestTransfer.transferId}`,
+                              latestTransfer.transferId
+                            )
+                          }
+                        >
+                          <ExternalLink size={16} />
+                          <span>Open Download Page</span>
+                        </button>
+
+                        <a
+                          href={`/api/files/${encodeURIComponent(latestTransfer.file.filename)}/view`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="btn-preview-transfer"
+                        >
+                          <ExternalLink size={16} />
+                          <span>Preview File</span>
+                        </a>
+                      </div>
                     </div>
-                    <div className="transfer-id-actions">
-                      <button
-                        type="button"
-                        className="btn-copy-id"
+
+                    {/* Right Column: Prominent QR Code Generator */}
+                    <div className="success-qr-column">
+                      <div className="qr-badge-header">
+                        <QrCode size={16} className="qr-icon-highlight" />
+                        <span>SCAN TO DOWNLOAD</span>
+                      </div>
+
+                      <div
+                        className="qr-visual-box"
                         onClick={() =>
-                          copyToClipboard(
-                            latestTransfer.transferId,
-                            `id-${latestTransfer.transferId}`,
-                            'Transfer ID copied!'
-                          )
+                          setActiveQrModal({
+                            transferId: latestTransfer.transferId,
+                            filename: latestTransfer.file.filename,
+                            originalname: latestTransfer.file.originalname,
+                            size: latestTransfer.file.size,
+                            expiresAt: latestTransfer.expiresAt,
+                            url: getShareableUrl(latestTransfer.transferId)
+                          })
                         }
+                        title="Click to enlarge QR code"
                       >
-                        {copiedId === `id-${latestTransfer.transferId}` ? (
-                          <>
-                            <Check size={14} color="#10b981" />
-                            <span>Copied</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy size={14} />
-                            <span>Copy ID</span>
-                          </>
-                        )}
-                      </button>
+                        <QRCodeSVG
+                          value={getShareableUrl(latestTransfer.transferId)}
+                          size={160}
+                          bgColor="#ffffff"
+                          fgColor="#090d16"
+                          level="Q"
+                          marginSize={2}
+                        />
+                        <div className="qr-box-hover-badge">
+                          <Maximize2 size={20} />
+                          <span>Click to Enlarge</span>
+                        </div>
+                      </div>
+
+                      {/* Hidden canvas for high-quality PNG export */}
+                      <div style={{ display: 'none' }}>
+                        <QRCodeCanvas
+                          id={`qr-canvas-${latestTransfer.transferId}`}
+                          value={getShareableUrl(latestTransfer.transferId)}
+                          size={400}
+                          bgColor="#ffffff"
+                          fgColor="#090d16"
+                          level="H"
+                          marginSize={3}
+                        />
+                      </div>
+
+                      <p className="qr-visual-caption">
+                        Scan with your phone camera to download instantly on mobile.
+                      </p>
+
+                      <div className="qr-button-row">
+                        <button
+                          type="button"
+                          className="btn-qr-action"
+                          onClick={() =>
+                            downloadQrAsPng(
+                              latestTransfer.transferId,
+                              latestTransfer.file.originalname
+                            )
+                          }
+                          title="Save QR Code image as PNG"
+                        >
+                          <ImageDown size={15} />
+                          <span>Save QR Image</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          className="btn-qr-action"
+                          onClick={() =>
+                            setActiveQrModal({
+                              transferId: latestTransfer.transferId,
+                              filename: latestTransfer.file.filename,
+                              originalname: latestTransfer.file.originalname,
+                              size: latestTransfer.file.size,
+                              expiresAt: latestTransfer.expiresAt,
+                              url: getShareableUrl(latestTransfer.transferId)
+                            })
+                          }
+                          title="Enlarge QR Code"
+                        >
+                          <Maximize2 size={15} />
+                          <span>Enlarge</span>
+                        </button>
+                      </div>
                     </div>
-                  </div>
-
-                  <div className="success-action-row">
-                    <button
-                      type="button"
-                      className="btn-open-download-page"
-                      onClick={() =>
-                        navigateTo(
-                          `/download/${latestTransfer.transferId}`,
-                          latestTransfer.transferId
-                        )
-                      }
-                    >
-                      <ExternalLink size={16} />
-                      <span>Open Download Page</span>
-                    </button>
-
-                    <a
-                      href={`/api/files/${encodeURIComponent(latestTransfer.file.filename)}/view`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-preview-transfer"
-                    >
-                      <ExternalLink size={16} />
-                      <span>Preview File</span>
-                    </a>
                   </div>
                 </div>
               )}
@@ -874,7 +1123,15 @@ export default function App() {
                 <div className="feature-icon">⚡</div>
                 <div>
                   <h3 className="feature-heading">25 MB Limit</h3>
-                  <p className="feature-desc">Single-file transfers designed for fast delivery and demos.</p>
+                  <p className="feature-desc">Single-file transfers engineered for rapid, reliable delivery.</p>
+                </div>
+              </div>
+
+              <div className="feature-item">
+                <div className="feature-icon">📱</div>
+                <div>
+                  <h3 className="feature-heading">Instant QR Code</h3>
+                  <p className="feature-desc">Scan directly from camera for seamless cross-device downloads.</p>
                 </div>
               </div>
 
@@ -882,15 +1139,7 @@ export default function App() {
                 <div className="feature-icon">⏳</div>
                 <div>
                   <h3 className="feature-heading">24-Hour Expiry</h3>
-                  <p className="feature-desc">Files auto-expire to keep server storage clean and private.</p>
-                </div>
-              </div>
-
-              <div className="feature-item">
-                <div className="feature-icon">🔗</div>
-                <div>
-                  <h3 className="feature-heading">Dedicated Pages</h3>
-                  <p className="feature-desc">Clean, shareable download links for any recipient.</p>
+                  <p className="feature-desc">Transfers automatically clean up to preserve storage and privacy.</p>
                 </div>
               </div>
             </section>
@@ -943,7 +1192,7 @@ export default function App() {
                 <div className="files-grid">
                   {filteredFiles.map((file) => {
                     const typeInfo = getFileIcon(file.originalname, file.mimetype);
-                    const pageLink = `${window.location.origin}/download/${file.transferId}`;
+                    const pageLink = getShareableUrl(file.transferId);
                     const isCopiedLink = copiedId === `link-${file.filename}`;
                     const isCopiedId = copiedId === `id-${file.transferId}`;
 
@@ -986,6 +1235,19 @@ export default function App() {
                           </div>
                         </div>
 
+                        {/* Hidden canvas for PNG export from recent files */}
+                        <div style={{ display: 'none' }}>
+                          <QRCodeCanvas
+                            id={`qr-canvas-${file.transferId}`}
+                            value={pageLink}
+                            size={400}
+                            bgColor="#ffffff"
+                            fgColor="#090d16"
+                            level="H"
+                            marginSize={3}
+                          />
+                        </div>
+
                         <div className="file-item-actions">
                           <button
                             type="button"
@@ -1000,6 +1262,24 @@ export default function App() {
                           </button>
 
                           <div className="action-btn-cluster">
+                            <button
+                              type="button"
+                              className="action-icon-btn qr-btn"
+                              title="Show QR Code"
+                              onClick={() =>
+                                setActiveQrModal({
+                                  transferId: file.transferId,
+                                  filename: file.filename,
+                                  originalname: file.originalname,
+                                  size: file.size,
+                                  expiresAt: file.expiresAt,
+                                  url: pageLink
+                                })
+                              }
+                            >
+                              <QrCode size={15} />
+                            </button>
+
                             <button
                               type="button"
                               className="action-icon-btn"
@@ -1037,6 +1317,104 @@ export default function App() {
           </>
         )}
       </main>
+
+      {/* ========================================================= */}
+      {/* FULL-SCREEN QR CODE MODAL FOR EASY DESKTOP SCANNING       */}
+      {/* ========================================================= */}
+      {activeQrModal && (
+        <div
+          className="qr-modal-overlay animate-fade-in"
+          onClick={() => setActiveQrModal(null)}
+        >
+          <div
+            className="qr-modal-dialog animate-scale-up"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="qr-modal-header">
+              <div className="qr-modal-title-group">
+                <div className="qr-modal-icon-badge">
+                  <QrCode size={20} />
+                </div>
+                <div>
+                  <h3 className="qr-modal-title">Scan QR Code</h3>
+                  <p className="qr-modal-subtitle">Point phone camera to download instantly</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="qr-modal-close"
+                onClick={() => setActiveQrModal(null)}
+                title="Close QR modal"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="qr-modal-body">
+              <div className="qr-modal-code-wrapper">
+                <QRCodeSVG
+                  value={activeQrModal.url}
+                  size={240}
+                  bgColor="#ffffff"
+                  fgColor="#090d16"
+                  level="H"
+                  marginSize={3}
+                />
+              </div>
+
+              <div className="qr-modal-meta">
+                <span className="qr-modal-filename" title={activeQrModal.originalname}>
+                  {activeQrModal.originalname}
+                </span>
+                <div className="qr-modal-submeta">
+                  <span className="stat-pill">{formatBytes(activeQrModal.size)}</span>
+                  <span className="dot-sep">•</span>
+                  <span>ID: {activeQrModal.transferId}</span>
+                  <span className="dot-sep">•</span>
+                  <span>{formatTimeRemaining(activeQrModal.expiresAt)}</span>
+                </div>
+              </div>
+
+              <div className="qr-modal-actions">
+                <button
+                  type="button"
+                  className="btn-modal-action primary"
+                  onClick={() =>
+                    downloadQrAsPng(activeQrModal.transferId, activeQrModal.originalname)
+                  }
+                >
+                  <ImageDown size={16} />
+                  <span>Download QR PNG</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="btn-modal-action secondary"
+                  onClick={() => {
+                    copyToClipboard(
+                      activeQrModal.url,
+                      'modal-copy-link',
+                      'Download link copied!'
+                    );
+                  }}
+                >
+                  {copiedId === 'modal-copy-link' ? (
+                    <>
+                      <Check size={16} color="#10b981" />
+                      <span>Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={16} />
+                      <span>Copy Link</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Floating Toast Notification Container */}
       <div className="toast-portal">

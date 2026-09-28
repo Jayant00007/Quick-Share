@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QuickShare - Redirecting...</title>
+  <script>
+    // Single Page App redirect for 404 routes
+    const path = window.location.pathname;
+    const search = window.location.search;
+    const hash = window.location.hash;
+    const pathMatch = path.match(/^\/(?:download|transfer)\/([a-zA-Z0-9_-]+)/i);
+    if (pathMatch && pathMatch[1]) {
+      window.location.replace('/?download=' + encodeURIComponent(pathMatch[1]));
+    } else {
+      window.location.replace('/' + (search ? search : '') + (hash ? hash : ''));
+    }
+  </script>
+</head>
+<body style="background:#090d16;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+  <p>Redirecting to QuickShare transfer...</p>
+</body>
+</html>

@@ -28,10 +28,108 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// In-memory file registry for demo storage
-// Maps transferId -> file metadata & filename -> file metadata
+// In-memory file registry for fast lookup
 const transferRegistry = new Map();
 const filenameRegistry = new Map();
+
+// Helper: load transfer metadata by ID from memory or disk
+function getTransferData(transferId) {
+  if (!transferId) return null;
+  // 1. Check in-memory map
+  let data = transferRegistry.get(transferId);
+  if (data) return data;
+
+  // 2. Check disk metadata file
+  const safeId = String(transferId).replace(/[^a-zA-Z0-9_-]/g, '');
+  const metaPath = path.join(uploadsDir, `${safeId}.json`);
+  if (fs.existsSync(metaPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      const filePath = path.join(uploadsDir, parsed.filename);
+      if (fs.existsSync(filePath)) {
+        transferRegistry.set(parsed.transferId, parsed);
+        filenameRegistry.set(parsed.filename, parsed);
+        return parsed;
+      }
+    } catch (e) {
+      console.error(`Error reading metadata for ${transferId}:`, e);
+    }
+  }
+  return null;
+}
+
+// Helper: load transfer metadata by filename from memory or disk
+function getTransferByFilename(filename) {
+  if (!filename) return null;
+  let data = filenameRegistry.get(filename);
+  if (data) return data;
+
+  try {
+    if (fs.existsSync(uploadsDir)) {
+      const files = fs.readdirSync(uploadsDir);
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(path.join(uploadsDir, file), 'utf8'));
+            if (parsed.filename === filename) {
+              transferRegistry.set(parsed.transferId, parsed);
+              filenameRegistry.set(parsed.filename, parsed);
+              return parsed;
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Helper: list all active transfers from disk and memory
+function getAllActiveTransfers() {
+  cleanupExpiredFiles();
+  const now = Date.now();
+  const transfersMap = new Map();
+
+  // Load all .json files from uploadsDir
+  try {
+    if (fs.existsSync(uploadsDir)) {
+      const diskFiles = fs.readdirSync(uploadsDir);
+      for (const file of diskFiles) {
+        if (file.endsWith('.json')) {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(path.join(uploadsDir, file), 'utf8'));
+            const expiryTime = new Date(parsed.expiresAt).getTime();
+            const filePath = path.join(uploadsDir, parsed.filename);
+            if (now < expiryTime && fs.existsSync(filePath)) {
+              transfersMap.set(parsed.transferId, parsed);
+              transferRegistry.set(parsed.transferId, parsed);
+              filenameRegistry.set(parsed.filename, parsed);
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+
+  // Include in-memory entries if file exists
+  for (const [id, data] of transferRegistry.entries()) {
+    const expiryTime = new Date(data.expiresAt).getTime();
+    const filePath = path.join(uploadsDir, data.filename);
+    if (now < expiryTime && fs.existsSync(filePath)) {
+      transfersMap.set(id, data);
+    }
+  }
+
+  const result = Array.from(transfersMap.values()).map((file) => ({
+    ...file,
+    downloadUrl: `/api/files/${encodeURIComponent(file.filename)}/download`,
+    transferDownloadUrl: `/api/transfer/${encodeURIComponent(file.transferId)}/download`,
+    viewUrl: `/api/files/${encodeURIComponent(file.filename)}/view`
+  }));
+
+  result.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+  return result;
+}
 
 // Generate unique, readable transfer ID (e.g., qs-4a8f9c2e)
 function generateTransferId() {
@@ -44,16 +142,17 @@ function cleanupExpiredFiles() {
   const now = Date.now();
   let expiredCount = 0;
 
+  // 1. Clean from memory & disk
   for (const [transferId, fileData] of Array.from(transferRegistry.entries())) {
     const expiryTime = new Date(fileData.expiresAt).getTime();
     if (now > expiryTime) {
       const filePath = path.join(uploadsDir, fileData.filename);
+      const metaPath = path.join(uploadsDir, `${fileData.transferId}.json`);
       if (fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (e) {
-          console.error(`Failed to delete expired file ${fileData.filename}:`, e);
-        }
+        try { fs.unlinkSync(filePath); } catch (e) {}
+      }
+      if (fs.existsSync(metaPath)) {
+        try { fs.unlinkSync(metaPath); } catch (e) {}
       }
       transferRegistry.delete(transferId);
       filenameRegistry.delete(fileData.filename);
@@ -61,18 +160,34 @@ function cleanupExpiredFiles() {
     }
   }
 
-  // Also clean up any unindexed orphaned files older than 24 hours in uploads folder
+  // 2. Also clean any expired json or files directly on disk
   try {
-    const diskFiles = fs.readdirSync(uploadsDir);
-    for (const file of diskFiles) {
-      const filePath = path.join(uploadsDir, file);
-      const stats = fs.statSync(filePath);
-      if (stats.isFile()) {
-        const fileAge = now - (stats.birthtimeMs || stats.mtimeMs);
-        if (fileAge > EXPIRY_DURATION_MS) {
+    if (fs.existsSync(uploadsDir)) {
+      const diskFiles = fs.readdirSync(uploadsDir);
+      for (const file of diskFiles) {
+        const filePath = path.join(uploadsDir, file);
+        if (file.endsWith('.json')) {
           try {
-            fs.unlinkSync(filePath);
-            expiredCount++;
+            const meta = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            if (now > new Date(meta.expiresAt).getTime()) {
+              fs.unlinkSync(filePath);
+              const targetFile = path.join(uploadsDir, meta.filename);
+              if (fs.existsSync(targetFile)) {
+                fs.unlinkSync(targetFile);
+              }
+              expiredCount++;
+            }
+          } catch (e) {}
+        } else {
+          try {
+            const stats = fs.statSync(filePath);
+            if (stats.isFile()) {
+              const fileAge = now - (stats.birthtimeMs || stats.mtimeMs);
+              if (fileAge > EXPIRY_DURATION_MS) {
+                fs.unlinkSync(filePath);
+                expiredCount++;
+              }
+            }
           } catch (e) {}
         }
       }
@@ -82,44 +197,6 @@ function cleanupExpiredFiles() {
   if (expiredCount > 0) {
     console.log(`🧹 Cleaned up ${expiredCount} expired file(s)`);
   }
-}
-
-// Populate registry with any existing non-expired files in uploads on startup
-try {
-  if (fs.existsSync(uploadsDir)) {
-    const existingFiles = fs.readdirSync(uploadsDir);
-    const now = Date.now();
-    for (const filename of existingFiles) {
-      const filePath = path.join(uploadsDir, filename);
-      const stats = fs.statSync(filePath);
-      if (stats.isFile()) {
-        const createdTime = stats.birthtimeMs || stats.mtimeMs;
-        const expiresAtMs = createdTime + EXPIRY_DURATION_MS;
-
-        if (now > expiresAtMs) {
-          // Expired already
-          fs.unlinkSync(filePath);
-        } else {
-          const match = filename.match(/^\d+-(.+)$/);
-          const originalname = match ? match[1] : filename;
-          const transferId = generateTransferId();
-          const fileData = {
-            transferId,
-            filename,
-            originalname,
-            size: stats.size,
-            mimetype: 'application/octet-stream',
-            uploadedAt: new Date(createdTime).toISOString(),
-            expiresAt: new Date(expiresAtMs).toISOString()
-          };
-          transferRegistry.set(transferId, fileData);
-          filenameRegistry.set(filename, fileData);
-        }
-      }
-    }
-  }
-} catch (err) {
-  console.error('Notice: Could not index existing files on startup:', err);
 }
 
 // Run periodic cleanup every 10 minutes (if long-running process)
@@ -164,12 +241,13 @@ const upload = multer({
 
 // 1. Health check
 app.get('/api/health', (req, res) => {
+  const transfers = getAllActiveTransfers();
   res.json({
     status: 'ok',
     message: 'QuickShare API is active',
     maxFileSizeMB: 25,
     expiryHours: 24,
-    activeTransfers: transferRegistry.size
+    activeTransfers: transfers.length
   });
 });
 
@@ -220,14 +298,22 @@ app.post('/api/upload', (req, res) => {
       mimetype: req.file.mimetype || 'application/octet-stream',
       uploadedAt,
       expiresAt,
-      downloadUrl: `/api/files/${req.file.filename}/download`,
-      transferDownloadUrl: `/api/transfer/${transferId}/download`,
-      viewUrl: `/api/files/${req.file.filename}/view`
+      downloadUrl: `/api/files/${encodeURIComponent(req.file.filename)}/download`,
+      transferDownloadUrl: `/api/transfer/${encodeURIComponent(transferId)}/download`,
+      viewUrl: `/api/files/${encodeURIComponent(req.file.filename)}/view`
     };
 
-    // Store in temporary in-memory registries
+    // Store in in-memory registries
     transferRegistry.set(transferId, fileData);
     filenameRegistry.set(req.file.filename, fileData);
+
+    // Persist JSON metadata to disk for serverless/restart survivability
+    try {
+      const metaPath = path.join(uploadsDir, `${transferId}.json`);
+      fs.writeFileSync(metaPath, JSON.stringify(fileData, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to write transfer metadata json:', e);
+    }
 
     return res.status(201).json({
       message: 'File uploaded successfully! Available for 24 hours.',
@@ -240,24 +326,14 @@ app.post('/api/upload', (req, res) => {
 
 // 3. List all active files/transfers
 app.get('/api/files', (req, res) => {
-  cleanupExpiredFiles();
-  const files = Array.from(transferRegistry.values()).map((file) => ({
-    ...file,
-    downloadUrl: `/api/files/${file.filename}/download`,
-    transferDownloadUrl: `/api/transfer/${file.transferId}/download`,
-    viewUrl: `/api/files/${file.filename}/view`
-  }));
-
-  // Sort newest first
-  files.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
-
+  const files = getAllActiveTransfers();
   res.json({ files, count: files.length });
 });
 
 // 4. Get transfer by Transfer ID (checks 24h expiry)
 app.get('/api/transfer/:transferId', (req, res) => {
   const { transferId } = req.params;
-  const fileData = transferRegistry.get(transferId);
+  const fileData = getTransferData(transferId);
 
   if (!fileData) {
     return res.status(404).json({
@@ -275,12 +351,20 @@ app.get('/api/transfer/:transferId', (req, res) => {
     });
   }
 
+  const filePath = path.join(uploadsDir, fileData.filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: 'File missing',
+      message: 'The file for this transfer is no longer available on the server.'
+    });
+  }
+
   res.json({
     transfer: {
       ...fileData,
-      downloadUrl: `/api/files/${fileData.filename}/download`,
-      transferDownloadUrl: `/api/transfer/${fileData.transferId}/download`,
-      viewUrl: `/api/files/${fileData.filename}/view`
+      downloadUrl: `/api/files/${encodeURIComponent(fileData.filename)}/download`,
+      transferDownloadUrl: `/api/transfer/${encodeURIComponent(fileData.transferId)}/download`,
+      viewUrl: `/api/files/${encodeURIComponent(fileData.filename)}/view`
     }
   });
 });
@@ -288,7 +372,7 @@ app.get('/api/transfer/:transferId', (req, res) => {
 // 4b. Download directly by Transfer ID
 app.get('/api/transfer/:transferId/download', (req, res) => {
   const { transferId } = req.params;
-  const fileData = transferRegistry.get(transferId);
+  const fileData = getTransferData(transferId);
 
   if (!fileData) {
     return res.status(404).json({
@@ -332,7 +416,7 @@ app.get('/api/files/:filename/download', (req, res) => {
     });
   }
 
-  const fileInfo = filenameRegistry.get(filename);
+  const fileInfo = getTransferByFilename(filename);
   if (fileInfo && Date.now() > new Date(fileInfo.expiresAt).getTime()) {
     cleanupExpiredFiles();
     return res.status(410).json({
@@ -362,7 +446,7 @@ app.get('/api/files/:filename/view', (req, res) => {
     });
   }
 
-  const fileInfo = filenameRegistry.get(filename);
+  const fileInfo = getTransferByFilename(filename);
   if (fileInfo && fileInfo.mimetype) {
     res.setHeader('Content-Type', fileInfo.mimetype);
   }
@@ -374,7 +458,7 @@ app.get('/api/files/:filename/view', (req, res) => {
 app.delete('/api/files/:identifier', (req, res) => {
   const { identifier } = req.params;
   
-  let fileData = transferRegistry.get(identifier) || filenameRegistry.get(identifier);
+  let fileData = getTransferData(identifier) || getTransferByFilename(identifier);
   const filename = fileData ? fileData.filename : path.basename(identifier);
   const filePath = path.join(uploadsDir, filename);
 
@@ -387,6 +471,10 @@ app.delete('/api/files/:identifier', (req, res) => {
       fs.unlinkSync(filePath);
     }
     if (fileData) {
+      const metaPath = path.join(uploadsDir, `${fileData.transferId}.json`);
+      if (fs.existsSync(metaPath)) {
+        try { fs.unlinkSync(metaPath); } catch (e) {}
+      }
       transferRegistry.delete(fileData.transferId);
       filenameRegistry.delete(fileData.filename);
     } else {
